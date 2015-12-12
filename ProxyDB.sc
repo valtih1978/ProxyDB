@@ -15,19 +15,18 @@ import Utils._, scala.collection.mutable
 // Single file reduced this runtime to 12 sec, 10 times!
 // Moreover, with soft cache it is 33 seconds! More particularly,
 
-// below is the no improvement since step 1 - accumulating bundles 
-
+// Step3: write using file channel seems even slightly worse
 //JAVA_HOME=c:\Program Files (x86)\Java\jdk1.8.0_31
-// timeit "scala -J-Xmx33m ProxyDemo + 16 100 > nul" // 22 sec
-// timeit "scala -J-Xmx33m ProxyDemo + 16 100 scacheoff > nul" // 14 sec
-// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k > nul" // 39 sec
-// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k scacheoff > nul" // 76 sec
+// timeit "scala -J-Xmx33m ProxyDemo + 16 100 > nul" // 24 sec
+// timeit "scala -J-Xmx33m ProxyDemo + 16 100 scacheoff > nul" // 15 sec
+// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k > nul" // 41 sec
+// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k scacheoff > nul" // 77 sec
 
 //java_home=c:\Program Files\java\jre1.8.0_45
-// timeit "scala -J-Xmx33m ProxyDemo + 16 100 > nul" // 30 sec
+// timeit "scala -J-Xmx33m ProxyDemo + 16 100 > nul" // 29 sec
 // timeit "scala -J-Xmx33m ProxyDemo + 16 100 scacheoff > nul" 11 //  sec
-// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k > nul" // 25 sec
-// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k scacheoff > nul" // 47 sec
+// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k > nul" // 24 sec
+// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k scacheoff > nul" // 45 sec
 
 class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 	
@@ -111,6 +110,9 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 		val pcMap  = mutable.Map[Int, ProxyClass]()
 		val arrMap  = mutable.Map[Int, Array[Byte]]()
 		var size: Int = 0 ; val threshold = 1 << 12
+		def fcWriteLoop(buf: ByteBuffer) {
+			while (buf.remaining != 0) rafCh.write(buf)
+		}
 		def setPhysical(pc: ProxyClass, physical: Long) = {
 			//println("toDisk " + pc.dbid + " at " + address)
 			//rafCh.write(ByteBuffer.wrap(buf, 0, len))
@@ -119,7 +121,7 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 		class Baos(size: Int) extends ByteArrayOutputStream(size) {
 			def getbuf = buf // expose the buffer
 		}
-		def seekToEnd(code: Long => Unit) {val l = raf.length; raf.seek(l); code(l) }
+		def seekToEnd(code: Long => Unit) {val l = raf.length; rafCh.position(l); code(l) }
 		def store(pc: ProxyClass) {
 			val proxee = pc.proxee ; val dbid = pc.dbid
 			val baos = new Baos(threshold); closing(new ObjectOutputStream(baos))
@@ -127,8 +129,8 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 						case ts: ProxifiableField => ts.writeFields(oos, Db.this)
 						case _ => // this is conventional object
 			}} ; if (baos.size > (threshold >> 1)) { // large objects bypass the accumulator
-				seekToEnd{rl =>
-					raf.write(baos.getbuf, 0, baos.size) ; setPhysical(pc, rl)
+				seekToEnd{rl => setPhysical(pc, rl)
+					fcWriteLoop(ByteBuffer.wrap(baos.getbuf, 0, baos.size))
 					//writeBuf(pc, baos.getbuf, baos.size, rl)
 				}
 			} else { // small object -- accumulate in the buffer
@@ -141,21 +143,18 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 		}
 		def flush {
 			//println("serializing " + map.size + " objects starting at file size " + rafLen)
-			
-			
-			seekToEnd{rl => val list = arrMap.toList.map{case(dbid, ba) => pcMap(dbid) -> ba}
+			seekToEnd{rl =>
 				// mmb is slow
 				//val mmb = rafCh.map(FileChannel.MapMode.READ_WRITE, rl, size)
 				//val list = map.toArray // fix the order of the buffers
 				// channel.write(buffers) is ran not write some buffers http://stackoverflow.com/questions/34152777#comment56060165_34152777
 				//rafCh.write(list.map{case (_,v) => ByteBuffer.wrap(v)})
-				val baos = new Baos(size); list.foldLeft(rl) {case (rl, (pc, buf)) =>
-					baos.write(buf) ; setPhysical(pc, rl)
+				pcMap.foldLeft(rl) {case (rl, (dbid, pc)) => val buf = arrMap(dbid)
+					fcWriteLoop(ByteBuffer.wrap(buf)); setPhysical(pc, rl)
 					//; mmb.put(buf)
 					//writeBuf(pcMap(dbid), buf, buf.length, rl)
 					rl + buf.length
-				} ; assert(baos.size == size)
-				raf.write(baos.getbuf)
+				}
 			} ; size = 0 ; arrMap.clear ; pcMap.clear
 		}
   }
