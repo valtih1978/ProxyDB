@@ -1,26 +1,40 @@
 import java.lang.reflect.{Method, InvocationHandler, Proxy}
-import scala.language.{reflectiveCalls, existentials}, scala.language.postfixOps
-import scala.collection.mutable, java.io._, Utils._
+import scala.language.{existentials, reflectiveCalls, postfixOps}
+import java.nio._, java.io._, java.nio.channels._
+import Utils._, scala.collection.mutable
 
-// This implementaion can run all the application (ProxyDemo, PersistenceDemo and MutabilityDemo)
-// from first implementation. However, in contrast with the reduced version, it enables proxies
-// to GC, which is supposed to be more efficient in the long run, in case we have really many
-// managed objects. Experiment
+// in contrast with the reduced version, this DB enables proxies
+// to GC-collectable, which is supposed to be more efficient in
+// the long run, in case we have really many managed objects.
+// Experiment suggests that this is faster indeed
 	// timeit "scala -J-Xmx33m ProxyDemo + 16 100 > nul"
-// suggests that this is faster indeed.
 
-// Probably this does not make a lot of sense as long as we store each object in separate file
-// because maintaining a large folder is more memory demanding than maintaining the proxy list.
-// At least I must compare how sooner first version fails than this one.
+// since managed proxies end up in 129 sec whereas it needed 144 for reduced version.
+
+// It was the speed of multi-file DB implementation.
+// Single file reduced this runtime to 12 sec, 10 times!
+// Moreover, with soft cache it is 33 seconds! More particularly,
+
+//JAVA_HOME=c:\Program Files (x86)\Java\jdk1.8.0_31
+// timeit "scala -J-Xmx33m ProxyDemo + 16 100 > nul // 25 sec
+// timeit "scala -J-Xmx33m ProxyDemo + 16 100 scacheoff > nul // 17 sec
+// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k > nul" // 49 sec x32
+// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k scacheoff > nul" // 86 sec
 
 //java_home=c:\Program Files\java\jre1.8.0_45
-// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k > nul" // 846 sec
+// timeit "scala -J-Xmx33m ProxyDemo + 16 100 > nul // 27 sec
+// timeit "scala -J-Xmx33m ProxyDemo + 16 100 scacheoff > nul // 11 sec
+// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k > nul" // 846 => 30 sec, speedup 30 times!
+// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k > nul scacheoff" // 49 sec
 
 class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 	
 	import java.lang.ref._
 	
 	System.err.println(s"hard cache size $cacheSize objects, dir = $dir")
+	
+	var raf: RandomAccessFile = _ ; var rafCh: FileChannel = _
+	var physicalIndex: RafIndex = _
 	
 	// We probably do not need this since soft references are employed.
 	val hardCache = mutable.Queue[Proxy]()
@@ -37,7 +51,7 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 	// Physical ID might be used to support mutability. When object
 	// is updated, a new revision is created. In append-only DB,
 	// physical ID may be the offset of the serialized object
-		//var physicalDBID: Int
+		var physicalID: Long = -1// use phys id -1 for `not initialized`. It is -1 when new object added or not yet loaded
 	
 		//println("creating " + this)
 		
@@ -55,12 +69,14 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 				case a => a
 			}
 			
-			if (proxee == null) { //println(s"restoring $this from disk")
-				proxee = closing(new ObjectInputStream(new FileInputStream(fname(dbid)))){
-					in => in.readObject match {
-						case ts: ProxifiableField => ts.readFields(in, Db.this) ; ts
-						case o => o // this is conventional object
-					}
+			if (proxee == null) {
+				if (physicalID == -1) physicalID = physicalIndex(dbid)//pass(physicalIndex(dbid)){p => println(s"restoring $this from unknown disk location, which happens to be $p") ; physicalID = p}
+				//else println(s"restoring $this from known disk location")
+				rafCh.position(physicalID) //; println("raf ch pos set to " + rafCh.position)
+				val in = new ObjectInputStream(Channels.newInputStream(rafCh))
+				proxee = in.readObject ; proxee match {
+					case ts: ProxifiableField => ts.readFields(in, Db.this) ; ts
+					case o => o // this is conventional object
 				}
 			}
 			
@@ -78,12 +94,20 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 	  
 		def serializeDirty = if (dirty) {
 			//println(dbid + " was dirty")
-			closing(new ObjectOutputStream(new FileOutputStream(fname(dbid))))
-			{ oos => oos.writeObject(proxee) ; proxee match {
-						case ts: ProxifiableField => ts.writeFields(oos, Db.this)
-						case _ => // this is conventional object
-			}} ; dirty = false
 			
+			/*closing(new ObjectOutputStream(new OutputStream {
+				def write(b: Int) = raf.writeByte(b)
+				def write(buf: Array[Byte], off: Int, len: Int) = raf.write(buf, off, len)
+				def write(buf: Array[Byte]) = raf.write(buf)
+			}))*/
+			physicalID = raf.length; rafCh.position(physicalID)
+			val oos = new ObjectOutputStream(Channels.newOutputStream(rafCh))
+			oos.writeObject(proxee) ; proxee match {
+					case ts: ProxifiableField => ts.writeFields(oos, Db.this)
+					case _ => // this is conventional object
+			} ; oos.flush
+			physicalIndex(dbid) = physicalID ; dirty = false
+			//println("after write, raf len = " + raf.length)
 		}
 
 	  override def toString = (if (proxee == null) "-" else "+") + dbid
@@ -119,7 +143,7 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 	val weakProxies: mutable.Map[Int, MyWR] = mutable.Map()
 	
 	var total: Int = _
-
+	
 	//import scala.reflect.runtime.universe._
 	//def getType[T: TypeTag](a: T): Type = typeOf[T]
 	def put[T <: AnyRef with Serializable, I](proxee: T, supportedInterfaces: Class[I]) = {
@@ -127,7 +151,7 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 		val pc = new ProxyClass(total, proxee, supportedInterfaces, true)
 		val proxy = makeProxy(pc).asInstanceOf[Proxy]
 		activate(proxy) ; proxy.asInstanceOf[I] // need to activate coz deactivation serializes the object
- 	}
+	}
 
 	
 	private val rq = new ReferenceQueue[Proxy]() ; var finalizedPC = 0
@@ -150,9 +174,9 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
    	proxy
 	}
 	
- 	def fname(dbid: Int/*, physicalID: Int*/): File = fname("" + dbid/* + "." + physicalID*/)
- 	def fname(dbid: String) = new File(dir + "/" + dbid)
-
+ 	def fname(name: String) = new File(pname(name))
+	def pname(name: String) = dir + "/" + name
+	
  	// names are used for persistence
  	val names = mutable.Map[String, (Int, Class[_])]() ; val fNames = fname("roots.lst")
  	def name(name: String, p: Object) = {
@@ -182,7 +206,7 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 			}
  		}
  	}
-
+ 	
 	def flush {
 		//serialize(fNames, names toList)
 		closing(new PrintWriter(fNames))( pw => names.foreach {
@@ -192,9 +216,12 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 		hardCache map proxyClass foreach { _.serializeDirty}
 	}
 		
+	val physicalIndexPath = pname("physicalid.longs")
+	
 	def close() {
 		rqClean ; System.err.println(s"finalized + " + decimal(finalizedPC) + ", number of proxies remaining known to the db = " + weakProxies.size)
-		flush ; hardCache.clear ; names.clear
+		flush ; hardCache.clear ; names.clear ; physicalIndex(0) = total
+		physicalIndex.close ; rafCh.close; raf.close
 		// stop any threads if running
 		// can fail in the assertion once all resources closed?
 		//assert (updating.active.size == 0 , "there are incomplete updates: " + updating.active.keys.mkString(","))
@@ -206,15 +233,18 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 							names(nameval(0)) = (nameval(1) toInt, class4name(nameval(2)))
 		})
 		
-		total = dir.list().length - 1 // one file is for names, other are regular objects
+		physicalIndex = new MmfIndex(physicalIndexPath) ; total = physicalIndex(0).toInt
+		raf = new RandomAccessFile(pname("objects.bin"), "rw") ; rafCh = raf.getChannel
+		
 	}
 	def restart() = { close ; open }
 
 	if (clean) {
 	 	dir.mkdir()
-	 	dir.listFiles().foreach { f => java.nio.file.Files.deleteIfExists(f.toPath())}
+	 	dir.listFiles().foreach { f => file.Files.deleteIfExists(f.toPath())}
 	 	assert(dir.list().length == 0)
-	 	fNames.createNewFile()
+	 	fNames.createNewFile() ; val total = 0
+	 	closing(new RafIndex(physicalIndexPath)){_.append(total)} // reset total to 0
 	}
 	
 	open()
