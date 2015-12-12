@@ -15,18 +15,31 @@ import Utils._, scala.collection.mutable
 // Single file reduced this runtime to 12 sec, 10 times!
 // Moreover, with soft cache it is 33 seconds! More particularly,
 
-// Step3: write using file channel seems even slightly worse
+// write buf size 2^12 is a disaster
 //JAVA_HOME=c:\Program Files (x86)\Java\jdk1.8.0_31
-// timeit "scala -J-Xmx33m ProxyDemo + 16 100 > nul" // 24 sec
-// timeit "scala -J-Xmx33m ProxyDemo + 16 100 scacheoff > nul" // 15 sec
-// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k > nul" // 41 sec
-// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k scacheoff > nul" // 77 sec
+// timeit "scala -J-Xmx33m ProxyDemo + 16 100 > nul" // 30 sec
+//timeit "scala -J-Xmx33m ProxyDemo + 16 100 scacheoff > nul" // 21 sec
+// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k > nul" // 79 sec
+// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k scacheoff > nul" // 105 sec
 
 //java_home=c:\Program Files\java\jre1.8.0_45
-// timeit "scala -J-Xmx33m ProxyDemo + 16 100 > nul" // 29 sec
-// timeit "scala -J-Xmx33m ProxyDemo + 16 100 scacheoff > nul" 11 //  sec
-// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k > nul" // 24 sec
-// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k scacheoff > nul" // 45 sec
+// timeit "scala -J-Xmx33m ProxyDemo + 16 100 > nul" // 32 sec
+// timeit "scala -J-Xmx33m ProxyDemo + 16 100 scacheoff > nul" // 19 sec
+// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k > nul" // 61 sec
+// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k scacheoff > nul" // 72 sec
+
+// write buf size = 2^17 is much better than 1^12 but still worse than non-mapped solutions
+//JAVA_HOME=c:\Program Files (x86)\Java\jdk1.8.0_31
+// timeit "scala -J-Xmx33m ProxyDemo + 16 100 > nul" // 34 sec
+// timeit "scala -J-Xmx33m ProxyDemo + 16 100 scacheoff > nul" // 19 sec
+// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k > nul" // 54 sec
+// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k scacheoff > nul" // 98 sec
+
+//java_home=c:\Program Files\java\jre1.8.0_45
+// timeit "scala -J-Xmx33m ProxyDemo + 16 100 > nul" // 40 sec
+// timeit "scala -J-Xmx33m ProxyDemo + 16 100 scacheoff > nul" 14 //  sec
+// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k > nul" // 36 sec
+// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k scacheoff > nul" // 53 sec
 
 class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 	
@@ -109,10 +122,7 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
   	// while object is stored here it may become dirty many times and we just update it instead of serializing
 		val pcMap  = mutable.Map[Int, ProxyClass]()
 		val arrMap  = mutable.Map[Int, Array[Byte]]()
-		var size: Int = 0 ; val threshold = 1 << 12
-		def fcWriteLoop(buf: ByteBuffer) {
-			while (buf.remaining != 0) rafCh.write(buf)
-		}
+		var size: Int = 0 ; val threshold = 1 << 17
 		def setPhysical(pc: ProxyClass, physical: Long) = {
 			//println("toDisk " + pc.dbid + " at " + address)
 			//rafCh.write(ByteBuffer.wrap(buf, 0, len))
@@ -121,7 +131,9 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 		class Baos(size: Int) extends ByteArrayOutputStream(size) {
 			def getbuf = buf // expose the buffer
 		}
-		def seekToEnd(code: Long => Unit) {val l = raf.length; rafCh.position(l); code(l) }
+		def seekToEnd(size: Int)(code: (Long, MappedByteBuffer) => Unit) {
+			val l = raf.length ; code(l, rafCh.map(FileChannel.MapMode.READ_WRITE, l, size))
+		}
 		def store(pc: ProxyClass) {
 			val proxee = pc.proxee ; val dbid = pc.dbid
 			val baos = new Baos(threshold); closing(new ObjectOutputStream(baos))
@@ -129,8 +141,8 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 						case ts: ProxifiableField => ts.writeFields(oos, Db.this)
 						case _ => // this is conventional object
 			}} ; if (baos.size > (threshold >> 1)) { // large objects bypass the accumulator
-				seekToEnd{rl => setPhysical(pc, rl)
-					fcWriteLoop(ByteBuffer.wrap(baos.getbuf, 0, baos.size))
+				seekToEnd(baos.size){(rl, mmb) => setPhysical(pc, rl)
+					mmb.put(baos.getbuf, 0, baos.size)
 					//writeBuf(pc, baos.getbuf, baos.size, rl)
 				}
 			} else { // small object -- accumulate in the buffer
@@ -143,15 +155,14 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 		}
 		def flush {
 			//println("serializing " + map.size + " objects starting at file size " + rafLen)
-			seekToEnd{rl =>
+			seekToEnd(size){(rl, mmb) =>
 				// mmb is slow
 				//val mmb = rafCh.map(FileChannel.MapMode.READ_WRITE, rl, size)
 				//val list = map.toArray // fix the order of the buffers
 				// channel.write(buffers) is ran not write some buffers http://stackoverflow.com/questions/34152777#comment56060165_34152777
 				//rafCh.write(list.map{case (_,v) => ByteBuffer.wrap(v)})
 				pcMap.foldLeft(rl) {case (rl, (dbid, pc)) => val buf = arrMap(dbid)
-					fcWriteLoop(ByteBuffer.wrap(buf)); setPhysical(pc, rl)
-					//; mmb.put(buf)
+					mmb.put(buf); setPhysical(pc, rl)
 					//writeBuf(pcMap(dbid), buf, buf.length, rl)
 					rl + buf.length
 				}
