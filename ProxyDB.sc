@@ -16,16 +16,16 @@ import Utils._, scala.collection.mutable
 // Moreover, with soft cache it is 33 seconds! More particularly,
 
 //JAVA_HOME=c:\Program Files (x86)\Java\jdk1.8.0_31
-// timeit "scala -J-Xmx33m ProxyDemo + 16 100 > nul // 25 sec
-// timeit "scala -J-Xmx33m ProxyDemo + 16 100 scacheoff > nul // 17 sec
-// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k > nul" // 49 sec x32
-// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k scacheoff > nul" // 86 sec
+// timeit "scala -J-Xmx33m ProxyDemo + 16 100 > nul" // 23 sec
+// timeit "scala -J-Xmx33m ProxyDemo + 16 100 scacheoff > nul" // 14 sec
+// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k > nul" // 40 sec
+// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k scacheoff > nul" // 78 sec
 
 //java_home=c:\Program Files\java\jre1.8.0_45
-// timeit "scala -J-Xmx33m ProxyDemo + 16 100 > nul // 27 sec
-// timeit "scala -J-Xmx33m ProxyDemo + 16 100 scacheoff > nul // 11 sec
-// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k > nul" // 846 => 30 sec, speedup 30 times!
-// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k > nul scacheoff" // 49 sec
+// timeit "scala -J-Xmx33m ProxyDemo + 16 100 > nul" // 30 sec
+// timeit "scala -J-Xmx33m ProxyDemo + 16 100 scacheoff > nul" // 10  sec
+// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k > nul" // 23 sec
+// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k scacheoff > nul" // 47 sec
 
 class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 	
@@ -70,19 +70,26 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 			}
 			
 			if (proxee == null) {
-				if (physicalID == -1) physicalID = physicalIndex(dbid)//pass(physicalIndex(dbid)){p => println(s"restoring $this from unknown disk location, which happens to be $p") ; physicalID = p}
-				//else println(s"restoring $this from known disk location")
-				rafCh.position(physicalID) //; println("raf ch pos set to " + rafCh.position)
-				val in = new ObjectInputStream(Channels.newInputStream(rafCh))
-				proxee = in.readObject ; proxee match {
-					case ts: ProxifiableField => ts.readFields(in, Db.this) ; ts
+				//if (physicalID == -1) physicalID = physicalIndex(dbid)
+				val in = serializedQueueToDisk.arrMap.get(dbid).map {ba =>
+					if (serializedQueueToDisk.pcMap(dbid) != this) println ("curiously, object was serialized in-mem with another proxy " + id(serializedQueueToDisk.pcMap(dbid)) + s" whereas $this is " + id(this))
+					serializedQueueToDisk.pcMap(dbid) = this
+					//println(s"deserializing $this from mem ")
+					new ByteArrayInputStream(ba)
+				}.getOrElse {
+					if (physicalID == -1) physicalID = pass(physicalIndex(dbid)){identity}//{p => println(s"restoring $this from unknown disk location, which happens to be $p")}
+//					else println(s"restoring $this from known disk location " + physicalID)
+					rafCh.position(physicalID) //; println("raf ch pos set to " + rafCh.position)
+					Channels.newInputStream(rafCh)
+				}
+				val ois = new ObjectInputStream(in)
+				proxee = ois.readObject ; proxee match {
+					case ts: ProxifiableField => ts.readFields(ois, Db.this) ; ts
 					case o => o // this is conventional object
 				}
 			}
 			
-			activate(proxy.asInstanceOf[Proxy])
-			
-			//println("calling2 " + this +"."+ method.getName)
+			if (!updating.active.contains(this)) activate(proxy.asInstanceOf[Proxy])
 			
 			invokeProxee(method, args)
 			
@@ -92,27 +99,55 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 	    method.invoke(proxee, args: _*)
 	   }
 	  
-		def serializeDirty = if (dirty) {
-			//println(dbid + " was dirty")
-			
-			/*closing(new ObjectOutputStream(new OutputStream {
-				def write(b: Int) = raf.writeByte(b)
-				def write(buf: Array[Byte], off: Int, len: Int) = raf.write(buf, off, len)
-				def write(buf: Array[Byte]) = raf.write(buf)
-			}))*/
-			physicalID = raf.length; rafCh.position(physicalID)
-			val oos = new ObjectOutputStream(Channels.newOutputStream(rafCh))
-			oos.writeObject(proxee) ; proxee match {
-					case ts: ProxifiableField => ts.writeFields(oos, Db.this)
-					case _ => // this is conventional object
-			} ; oos.flush
-			physicalIndex(dbid) = physicalID ; dirty = false
-			//println("after write, raf len = " + raf.length)
-		}
-
+		def serializeDirty = if (dirty) serializedQueueToDisk.store(this)
+		
 	  override def toString = (if (proxee == null) "-" else "+") + dbid
 	}
 
+  object serializedQueueToDisk {
+  	// while object is stored here it may become dirty many times and we just update it instead of serializing
+		val pcMap  = mutable.Map[Int, ProxyClass]()
+		val arrMap  = mutable.Map[Int, Array[Byte]]()
+		var size: Int = 0 ; val threshold = 1 << 12
+		def writeBuf(pc: ProxyClass, buf: Array[Byte], len: Int, physical: Long) = {
+			//println("toDisk " + pc.dbid + " at " + address)
+			//rafCh.write(ByteBuffer.wrap(buf, 0, len))
+			raf.write(buf, 0, len)
+			physicalIndex(pc.dbid) = physical; pc.physicalID = physical
+		}
+		def seekToEnd(code: Long => Unit) {val l = raf.length; raf.seek(l); code(l) }
+		def store(pc: ProxyClass) {
+			val proxee = pc.proxee ; val dbid = pc.dbid
+			val baos = new ByteArrayOutputStream(100) {
+				def getbuf = buf // expose the buffer
+			} ; closing(new ObjectOutputStream(baos))
+			{ oos => oos.writeObject(proxee) ; proxee match {
+						case ts: ProxifiableField => ts.writeFields(oos, Db.this)
+						case _ => // this is conventional object
+			}} ; if (baos.size > (threshold >> 1)) { // large objects bypass the accumulator
+				seekToEnd(rl => writeBuf(pc, baos.getbuf, baos.size, rl))
+			} else { // small object -- accumulate in the buffer
+				arrMap.get(pc.dbid).foreach{ arr => size -= arr.length
+					//println("reserialising while in mem " + pc + ", size = " + size)
+				} ;arrMap(dbid) = baos.toByteArray() ; pcMap(pc.dbid) = pc
+				size += baos.size ; if (size > threshold) flush
+			} ; pc.dirty = false
+			//println(s"$pc of size " + baos.size + " registered to save. " + map.size + " objects awaiting save. Their size is " + size)
+		}
+		def flush {
+			//println("serializing " + map.size + " objects starting at file size " + rafLen)
+			
+			// mmb is slow
+			//val mmb = rafCh.map(FileChannel.MapMode.READ_WRITE, rafLen, size)
+			//val list = map.toArray // fix the order of the buffers
+			// channel.write(buffers) is ran not write some buffers http://stackoverflow.com/questions/34152777#comment56060165_34152777
+			//rafCh.write(list.map{case (_,v) => ByteBuffer.wrap(v)})
+			seekToEnd(rl => arrMap.foldLeft(rl) {case (rl, (dbid, buf)) =>
+				//; mmb.put(buf)
+				writeBuf(pcMap(dbid), buf, buf.length, rl) ; rl + buf.length
+			}) ; size = 0 ; arrMap.clear ; pcMap.clear
+		}
+  }
 	
 	def activate(proxy: Proxy) {
 		hardCache.dequeueAll(_ eq proxy)
@@ -214,6 +249,7 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 		})
 		
 		hardCache map proxyClass foreach { _.serializeDirty}
+		serializedQueueToDisk.flush
 	}
 		
 	val physicalIndexPath = pname("physicalid.longs")
@@ -235,8 +271,8 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 		
 		physicalIndex = new MmfIndex(physicalIndexPath) ; total = physicalIndex(0).toInt
 		raf = new RandomAccessFile(pname("objects.bin"), "rw") ; rafCh = raf.getChannel
-		
 	}
+
 	def restart() = { close ; open }
 
 	if (clean) {
