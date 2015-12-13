@@ -70,7 +70,7 @@ object MmfDemo extends App {
 
 class RafIndex(fn: String) extends Closeable {
 	val raf = new RandomAccessFile(fn, "rw")
-	def append(l: Long) = this(raf.length.toInt) = l
+	def append(l: Long) = {this(raf.length.toInt) = l ; this}
 	def update(pos: Int, value: Long) = {raf.seek(pos) ; raf.writeLong(value) }
 	def apply(pos: Int) = {raf.seek(pos.toLong << 3) ; raf.readLong }
 	def close = raf.close
@@ -93,7 +93,7 @@ class MmfIndex(fn: String) extends RafIndex(fn) {
 		pos = address +1
 		select(address).get
 	}
-	override def append(value: Long) = this(pos) = value
+	override def append(value: Long) = {this(pos) = value; this}
 	override def update(pos: Int, value: Long) = {
 		select(pos).put(value) ; this.pos += 1
 	}
