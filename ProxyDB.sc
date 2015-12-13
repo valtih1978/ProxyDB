@@ -3,29 +3,21 @@ import scala.language.{existentials, reflectiveCalls, postfixOps}
 import java.nio._, java.io._, java.nio.channels._
 import Utils._, scala.collection.mutable
 
-// in contrast with the reduced version, this DB enables proxies
-// to GC-collectable, which is supposed to be more efficient in
-// the long run, in case we have really many managed objects.
-// Experiment suggests that this is faster indeed
-	// timeit "scala -J-Xmx33m ProxyDemo + 16 100 > nul"
+// results are noticeably worse, especially when I used Scala reflection in the beginning.
+// I have got => better results after factored out the common part and then after switching 
+// to Java Reflection.
 
-// since managed proxies end up in 129 sec whereas it needed 144 for reduced version.
-
-// It was the speed of multi-file DB implementation.
-// Single file reduced this runtime to 12 sec, 10 times!
-// Moreover, with soft cache it is 33 seconds! More particularly,
-
-//JAVA_HOME=c:\Program Files (x86)\Java\jdk1.8.0_31
-// timeit "scala -J-Xmx33m ProxyDemo + 16 100 > nul // 25 sec
-// timeit "scala -J-Xmx33m ProxyDemo + 16 100 scacheoff > nul // 17 sec
-// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k > nul" // 49 sec x32
-// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k scacheoff > nul" // 86 sec
+//JAVA_HOME=c:\Program Files (x86)\Java\jdk1.8.0_31:
+// timeit "scala -J-Xmx33m ProxyDemo + 16 100 > nul // 41 sec => 33 => 25
+// timeit "scala -J-Xmx33m ProxyDemo + 16 100 scacheoff > nul // 31 sec => 22 => 17
+// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k > nul" // 79 => 60 => 51
+// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k scacheoff > nul" // 144 => 106 => 87
 
 //java_home=c:\Program Files\java\jre1.8.0_45
-// timeit "scala -J-Xmx33m ProxyDemo + 16 100 > nul // 27 sec
-// timeit "scala -J-Xmx33m ProxyDemo + 16 100 scacheoff > nul // 11 sec
-// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k > nul" // 846 => 30 sec, speedup 30 times!
-// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k > nul scacheoff" // 49 sec
+// timeit "scala -J-Xmx33m ProxyDemo + 16 100 > nul // 35 => 32 => 30
+// timeit "scala -J-Xmx33m ProxyDemo + 16 100 scacheoff > nul // 18 => 14 => 12
+// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k > nul" // 42 => 36 => 31
+// timeit "scala -J-Xmx1000m ProxyDemo + 18 1k scacheoff > nul" // 70 => 57 => 52
 
 class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 	
@@ -43,10 +35,15 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 	// constructor of weakref needs a proxy, which needs proxy class
 	// for its constructor.
 	// When proxee != null in constructor, must set drity = Yes and call activate. This will force serialization on eviction.
-	class ProxyClass (
+	class ProxyClass (proxy: Proxy,
 		val dbid: Int, var proxee: Object, //  not null proxees must be exacly in the actives
 		val implements: Class[_],
-		var dirty: Boolean) extends InvocationHandler { rqClean
+		var dirty: Boolean
+
+	//class HardReference[T](val referent: Proxy, rq1: Object) extends SoftReference[Proxy](referent, rq)
+	//class MyWR(val dbid: Int, proxy: Proxy) extends WeakReference[Proxy](proxy, rq)
+	
+		) extends WeakReference(proxy, rq) with InvocationHandler { rqClean
 	
 	// Physical ID might be used to support mutability. When object
 	// is updated, a new revision is created. In append-only DB,
@@ -60,8 +57,7 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 	  override def invoke(proxy: Object, method: Method, args: Array[Object]): AnyRef = {
 
 			//println("calling1 " + this +"."+ method.getName + ", victims = " + victims)
-			
-			assert(weakProxies(dbid).get == proxy, "proxy in the weak map mismatches the invoked one")
+			assert(weakProxies(dbid) == this, s"invoking $this over finalized proxy!") ;	assert(get == proxy, this + " proxy in the weak map mismatches the invoked one")
 			//assert(wr.get eq proxy, this + s" is accessed through ${System.identityHashCode(proxy)} but is known as ${wr.get} in our weakMap")
 			
 			proxee = proxee match {
@@ -113,7 +109,6 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 	  override def toString = (if (proxee == null) "-" else "+") + dbid
 	}
 
-	
 	def activate(proxy: Proxy) {
 		hardCache.dequeueAll(_ eq proxy)
 		evict(cacheSize)
@@ -140,7 +135,7 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 
 
 	// includes both active and not-yet-GC'ed proxies
-	val weakProxies: mutable.Map[Int, MyWR] = mutable.Map()
+	val weakProxies: mutable.Map[Int, ProxyClass] = mutable.Map()
 	
 	var total: Int = _
 	
@@ -148,8 +143,7 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 	//def getType[T: TypeTag](a: T): Type = typeOf[T]
 	def put[T <: AnyRef with Serializable, I](proxee: T, supportedInterfaces: Class[I]) = {
 		total += 1 ;
-		val pc = new ProxyClass(total, proxee, supportedInterfaces, true)
-		val proxy = makeProxy(pc).asInstanceOf[Proxy]
+		val proxy = makeProxy(total, proxee, supportedInterfaces, true).asInstanceOf[Proxy]
 		activate(proxy) ; proxy.asInstanceOf[I] // need to activate coz deactivation serializes the object
 	}
 
@@ -157,20 +151,24 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 	private val rq = new ReferenceQueue[Proxy]() ; var finalizedPC = 0
 	@annotation.tailrec final def rqClean {rq.poll match {
 		case null =>
-		case top =>	finalizedPC += 1; val dbid = top.asInstanceOf[MyWR].dbid
+		case top =>	finalizedPC += 1; val dbid = top.asInstanceOf[ProxyClass].dbid
 			assert(weakProxies.contains(dbid)) ; val current = weakProxies(dbid)
 			//println((if (current != top) "a previous copy of " else "") + s"proxy with dbid " + dbid + " was finalized")
 			if (current == top) weakProxies -= dbid ; rqClean
 	}}
 	
-	//class HardReference[T](val referent: Proxy, rq1: Object) extends SoftReference[Proxy](referent, rq)
-	class MyWR(val dbid: Int, proxy: Proxy) extends WeakReference[Proxy](proxy, rq)
+	object FakeIH extends InvocationHandler {
+	  override def invoke(proxy: Object, method: Method, args: Array[Object]): AnyRef = {
+	  	throw new Exception("this handler is supposed to be replaced by weak reference rather than called.")
+	  }
+	}
 	
 	//pc must have proxee initialized
-	def makeProxy(pc: ProxyClass) = {
-		assert(!weakProxies.contains(pc.dbid) || weakProxies(pc.dbid).get == null)
-		val proxy = Proxy.newProxyInstance(pc.implements.getClassLoader, Array(pc.implements), pc)
-   	weakProxies(pc.dbid) = new MyWR(pc.dbid, proxy.asInstanceOf[Proxy])
+	def makeProxy(dbid: Int, proxee: Object, implements: Class[_], dirty: Boolean) = {
+		assert(!weakProxies.contains(dbid) || weakProxies(dbid).get == null)
+		val proxy = Proxy.newProxyInstance(implements.getClassLoader, Array(implements), FakeIH).asInstanceOf[Proxy]
+		val pc = new ProxyClass(proxy, dbid, proxee, implements, dirty)
+   	weakProxies(dbid) = pc ; updateInvocationHandler(proxy, pc)
    	proxy
 	}
 	
@@ -251,7 +249,7 @@ class Db(dir: File, var cacheSize: Int, clean: Boolean) {
 
 	def fromWeak(dbid: Int, implements: Class[_]) = {
 		weakProxies.get(dbid) map {_.get} filter(_!= null) getOrElse {
-			makeProxy(new ProxyClass(dbid, null, implements, false))
+			makeProxy(dbid, null, implements, false)
 		}
 	}
 }
